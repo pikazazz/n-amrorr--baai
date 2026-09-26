@@ -115,18 +115,68 @@ PIXELS_PER_METER = 176.0 # สเกลความสูง 1 เมตร = ~1
 ALERT_ORANGE_LEVEL = 2.20  # ลูกศรสีส้ม/เหลือง (ระดับเฝ้าระวัง ~2.20 ม.)
 ALERT_RED_LEVEL = 2.50     # ลูกศรสีแดง (ระดับวิกฤต ~2.50 ม.)
 
-# พิกัด Y ของขีดเตือนภัย (คำนวณอัตโนมัติหรือกำหนดคงที่)
+# ระดับสถิติน้ำท่วมประวัติศาสตร์ (ลูกศรสีน้ำเงิน)
+HIST_2565_LEVEL = 3.00     # สถิติน้ำท่วม ต.ค. 2565 (~3.00 ม.)
+HIST_2564_LEVEL = 3.04     # สถิติน้ำท่วม ต.ค. 2564 (~3.04 ม.)
+HIST_2553_LEVEL = 3.08     # สถิติน้ำท่วม ต.ค. 2553 (~3.08 ม.)
+HIST_2554_LEVEL = 4.08     # สถิติน้ำท่วม ต.ค. 2554 สูงสุดในประวัติศาสตร์ (~4.08 ม.)
+
+# พิกัด Y ของขีดเตือนภัยและสถิติต่างๆ
+Y_2554 = 40
+Y_2553 = 217
+Y_2564 = 224
+Y_2565 = 230
 Y_RED_ARROW = int(Y_300M + (3.00 - ALERT_RED_LEVEL) * PIXELS_PER_METER)    # ประมาณ Y=318
 Y_ORANGE_ARROW = int(Y_300M + (3.00 - ALERT_ORANGE_LEVEL) * PIXELS_PER_METER) # ประมาณ Y=371
+
+# ลำดับความรุนแรงของระดับน้ำ (Rank) สำหรับระบบรอเกณฑ์ถัดไป
+STAGE_RANKS = {
+    "NORMAL": 0,
+    "WARNING": 1,
+    "CRITICAL": 2,
+    "HIST_2565": 3,
+    "HIST_2564": 4,
+    "HIST_2553": 5,
+    "HIST_2554": 6,
+}
+
+STAGE_NAMES = {
+    "NORMAL": "ระดับปกติ",
+    "WARNING": "ระดับเฝ้าระวัง (สีส้ม)",
+    "CRITICAL": "ระดับวิกฤต (สีแดง)",
+    "HIST_2565": "สถิติปี 2565 (3.00 ม.)",
+    "HIST_2564": "สถิติปี 2564 (3.04 ม.)",
+    "HIST_2553": "สถิติปี 2553 (3.08 ม.)",
+    "HIST_2554": "สถิติสูงสุดปี 2554 (4.08 ม.)",
+}
 
 # การหน่วงเวลาเสียงเตือน (วินาที เพื่อไม่ให้เสียงดังถี่จนเกินไป)
 ALERT_SOUND_INTERVAL = 3.0 
 last_alert_time = 0
 
 # ตัวแปรสถานะ
-current_status = "NORMAL" # NORMAL, WARNING, CRITICAL
+current_status = "NORMAL"         # NORMAL, WARNING, CRITICAL, HIST_2565, HIST_2564, HIST_2553, HIST_2554
+acknowledged_stage = None         # เก็บเกณฑ์ที่ผู้ใช้กดรับทราบแล้ว
 current_level_m = 2.00
 is_running = True
+sound_stop_requested = threading.Event()
+
+
+def get_next_stage_hint(status):
+    """คำนวณข้อความเกณฑ์ถัดไปที่ระบบกำลังรอคอย"""
+    if status == "WARNING":
+        return f">= {ALERT_RED_LEVEL:.2f} ม. (CRITICAL สีแดง)"
+    elif status == "CRITICAL":
+        return f">= {HIST_2565_LEVEL:.2f} ม. (สถิติปี 2565)"
+    elif status == "HIST_2565":
+        return f">= {HIST_2564_LEVEL:.2f} ม. (สถิติปี 2564)"
+    elif status == "HIST_2564":
+        return f">= {HIST_2553_LEVEL:.2f} ม. (สถิติปี 2553)"
+    elif status == "HIST_2553":
+        return f">= {HIST_2554_LEVEL:.2f} ม. (สถิติสูงสุดปี 2554)"
+    elif status == "HIST_2554":
+        return "ระดับสูงสุดในประวัติศาสตร์แล้ว"
+    return f">= {ALERT_ORANGE_LEVEL:.2f} ม."
 
 
 # นำเข้า Win32 API สำหรับเร่งเสียงระบบ Windows อัตโนมัติ
@@ -150,13 +200,6 @@ except Exception:
 
 # พิกัดปุ่มรับทราบระดับน้ำบนหน้าจอ HUD (x1, y1, x2, y2)
 BTN_RECT = (18, 104, 322, 166)
-
-# ตัวแปรสถานะ
-current_status = "NORMAL"         # NORMAL, WARNING, CRITICAL
-acknowledged_stage = None         # เก็บเกณฑ์ที่ผู้ใช้กดรับทราบแล้ว (None, "WARNING", "CRITICAL")
-current_level_m = 2.00
-is_running = True
-sound_stop_requested = threading.Event()
 
 
 def maximize_system_volume():
@@ -185,14 +228,15 @@ def acknowledge_current_level():
     ฟังก์ชันรับทราบระดับน้ำ:
     - ดับเสียงเตือนทันที
     - บันทึกสถานะว่าได้รับทราบเกณฑ์นี้แล้ว (หยุดส่งเสียงเตือนซ้ำ)
-    - รอจนกว่าระดับน้ำจะเปลี่ยนแปลงหรือขึ้นสู่เกณฑ์ถัดไป (เช่น WARNING -> CRITICAL)
+    - รอจนกว่าระดับน้ำจะเปลี่ยนแปลงหรือขึ้นสู่เกณฑ์ถัดไป
     """
     global acknowledged_stage
     stop_alert_sound()
-    if current_status in ["WARNING", "CRITICAL"]:
+    if current_status != "NORMAL":
         acknowledged_stage = current_status
-        next_hint = f">= {ALERT_RED_LEVEL:.2f} ม. (CRITICAL)" if current_status == "WARNING" else "เกณฑ์สูงสุดแล้ว"
-        print(f"\n[{time.strftime('%H:%M:%S')}] 🔇 รับทราบระดับ {current_status} ({current_level_m:.2f} ม.) เรียบร้อยแล้ว")
+        next_hint = get_next_stage_hint(current_status)
+        stage_desc = STAGE_NAMES.get(current_status, current_status)
+        print(f"\n[{time.strftime('%H:%M:%S')}] 🔇 รับทราบระดับ {stage_desc} ({current_level_m:.2f} ม.) เรียบร้อยแล้ว")
         print(f"             -> ดับเสียงเตือนทันที! ระบบจะรอตรวจจับเกณฑ์ถัดไป: {next_hint}\n")
     else:
         print(f"\n[{time.strftime('%H:%M:%S')}] ℹ️ ขณะนี้ระดับน้ำปกติ ({current_level_m:.2f} ม.) ไม่มีการเตือนภัยที่ต้องปิดเสียง\n")
@@ -203,7 +247,7 @@ def play_alert_sound(status):
     sound_stop_requested.clear()
     maximize_system_volume()
     try:
-        if status == "CRITICAL":
+        if status in ["CRITICAL", "HIST_2565", "HIST_2564", "HIST_2553", "HIST_2554"]:
             # เสียงหวูดไซเรนอพยพน้ำท่วม (Air Raid / Evacuation Siren) แสบแก้วหู ปลุกคนหลับ
             if os.path.exists("loud_siren.wav"):
                 winsound.PlaySound("loud_siren.wav", winsound.SND_FILENAME)
@@ -276,59 +320,86 @@ def detect_waterline(frame):
 
 
 def draw_hud(frame, waterline_y, level_m, status, ack_stage):
-    """วาดกราฟิก สถานะเตือนภัย และปุ่มรับทราบระดับน้ำลงบนภาพ"""
+    """วาดกราฟิก สถานะเตือนภัย ขีดสถิติประวัติศาสตร์ และปุ่มรับทราบระดับน้ำลงบนภาพ"""
     annotated = frame.copy()
     h, w, _ = frame.shape
 
-    # 1. วาดเส้นอ้างอิงระดับต่างๆ
-    # ขีดสีแดง (ระดับวิกฤต 2.50 ม.)
-    cv2.line(annotated, (POLE_X_MIN - 50, Y_RED_ARROW), (POLE_X_MAX + 150, Y_RED_ARROW), (0, 0, 255), 2)
-    cv2.putText(annotated, f"CRITICAL: {ALERT_RED_LEVEL:.2f}m", (POLE_X_MAX + 160, Y_RED_ARROW + 5), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+    COL_HIST = (255, 195, 0)      # ฟ้า/น้ำเงิน (BGR: Sky Blue) สำหรับสถิติประวัติศาสตร์
+    COL_2554 = (255, 230, 60)     # ฟ้าสด/ไซแอน (สถิติสูงสุดปี 2554)
+    COL_RED = (0, 0, 255)
+    COL_ORANGE = (0, 165, 255)
 
-    # ขีดสีส้ม (ระดับเฝ้าระวัง 2.20 ม.)
-    cv2.line(annotated, (POLE_X_MIN - 50, Y_ORANGE_ARROW), (POLE_X_MAX + 150, Y_ORANGE_ARROW), (0, 165, 255), 2)
-    cv2.putText(annotated, f"WARNING: {ALERT_ORANGE_LEVEL:.2f}m", (POLE_X_MAX + 160, Y_ORANGE_ARROW + 5), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA)
+    # 1. วาดเส้นอ้างอิงระดับเตือนภัยและสถิติน้ำท่วมประวัติศาสตร์ (ป้ายสีน้ำเงิน)
+    def draw_ref_badge(img, y, label, color, line_x2=445, text_y=None, is_bold=False):
+        if text_y is None:
+            text_y = y + 4
+        cv2.line(img, (POLE_X_MIN - 40, y), (line_x2, y), color, 2 if is_bold else 1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+        tx = line_x2 + 6
+        cv2.rectangle(img, (tx - 3, text_y - th - 3), (tx + tw + 3, text_y + 3), (20, 20, 20), -1)
+        cv2.rectangle(img, (tx - 3, text_y - th - 3), (tx + tw + 3, text_y + 3), color, 1)
+        cv2.putText(img, label, (tx, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
+
+    # สถิติน้ำท่วมประวัติศาสตร์สีน้ำเงิน
+    draw_ref_badge(annotated, Y_2554, f"2554 (MAX): {HIST_2554_LEVEL:.2f}m", COL_2554, 445, Y_2554 + 4, is_bold=True)
+    draw_ref_badge(annotated, Y_2553, f"2553: {HIST_2553_LEVEL:.2f}m", COL_HIST, 445, 210)
+    draw_ref_badge(annotated, Y_2564, f"2564: {HIST_2564_LEVEL:.2f}m", COL_HIST, 445, 227)
+    draw_ref_badge(annotated, Y_2565, f"2565: {HIST_2565_LEVEL:.2f}m", COL_HIST, 445, 244)
+
+    # เกณฑ์วิกฤต (สีแดง 2.50 ม.) และเฝ้าระวัง (สีส้ม 2.20 ม.)
+    draw_ref_badge(annotated, Y_RED_ARROW, f"CRITICAL: {ALERT_RED_LEVEL:.2f}m", COL_RED, 445, Y_RED_ARROW + 4, is_bold=True)
+    draw_ref_badge(annotated, Y_ORANGE_ARROW, f"WARNING: {ALERT_ORANGE_LEVEL:.2f}m", COL_ORANGE, 445, Y_ORANGE_ARROW + 4, is_bold=True)
 
     # ขีดระดับผิวน้ำปัจจุบัน (Detected Waterline)
     water_color = (0, 255, 0) if status == "NORMAL" else ((0, 165, 255) if status == "WARNING" else (0, 0, 255))
+    if status in ["HIST_2565", "HIST_2564", "HIST_2553"]:
+        water_color = COL_HIST
+    elif status == "HIST_2554":
+        water_color = COL_2554
+
     cv2.line(annotated, (POLE_X_MIN - 40, waterline_y), (POLE_X_MAX + 80, waterline_y), (0, 255, 255), 2)
     cv2.putText(annotated, f"<-- WATER: {level_m:.2f}m", (POLE_X_MAX + 85, waterline_y + 4), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
 
     # 2. แถบป้าย Dashboard Banner ด้านบนซ้าย
-    is_acked = (ack_stage == status and status in ["WARNING", "CRITICAL"])
+    is_acked = (ack_stage == status and status != "NORMAL")
     banner_border = (50, 220, 120) if is_acked else water_color
     cv2.rectangle(annotated, (10, 10), (330, 175), (20, 20, 20), -1)
     cv2.rectangle(annotated, (10, 10), (330, 175), banner_border, 2)
 
-    status_text = "STATUS: SAFE (NORMAL)"
-    if status == "WARNING":
-        status_text = "STATUS: WARNING (ACKNOWLEDGED)" if is_acked else "STATUS: WARNING (ORANGE)!"
+    if status == "HIST_2554":
+        status_text = "STATUS: RECORD 2554 (ACKNOWLEDGED)" if is_acked else "STATUS: RECORD 2554 (MAX)!"
+    elif status == "HIST_2553":
+        status_text = "STATUS: 2553 (ACKNOWLEDGED)" if is_acked else "STATUS: EXCEEDED 2553 (3.08m)!"
+    elif status == "HIST_2564":
+        status_text = "STATUS: 2564 (ACKNOWLEDGED)" if is_acked else "STATUS: EXCEEDED 2564 (3.04m)!"
+    elif status == "HIST_2565":
+        status_text = "STATUS: 2565 (ACKNOWLEDGED)" if is_acked else "STATUS: EXCEEDED 2565 (3.00m)!"
     elif status == "CRITICAL":
         status_text = "STATUS: CRITICAL (ACKNOWLEDGED)" if is_acked else "STATUS: ALERT (RED CRITICAL)!"
+    elif status == "WARNING":
+        status_text = "STATUS: WARNING (ACKNOWLEDGED)" if is_acked else "STATUS: WARNING (ORANGE)!"
+    else:
+        status_text = "STATUS: SAFE (NORMAL)"
 
-    cv2.putText(annotated, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.52, banner_border, 2, cv2.LINE_AA)
+    cv2.putText(annotated, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.48, banner_border, 2, cv2.LINE_AA)
     cv2.putText(annotated, f"WATER LEVEL: {level_m:.2f} M", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(annotated, time.strftime("%Y-%m-%d %H:%M:%S"), (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
 
     # 3. ปุ่มรับทราบระดับน้ำ (Interactive Acknowledge Button)
     bx1, by1, bx2, by2 = BTN_RECT
     flash = (int(time.time() * 2.5) % 2 == 0)
+    next_hint = get_next_stage_hint(status)
 
-    if status in ["WARNING", "CRITICAL"] and not is_acked:
+    if status != "NORMAL" and not is_acked:
         # กำลังส่งเสียงเตือนภัย (ยังไม่ได้รับทราบ) -> ปุ่มกระพริบให้เห็นชัดเจน
-        if status == "CRITICAL":
+        if status in ["CRITICAL", "HIST_2565", "HIST_2564", "HIST_2553", "HIST_2554"]:
             btn_bg = (0, 0, 180) if flash else (0, 0, 110)
         else:
             btn_bg = (0, 90, 200) if flash else (0, 60, 140)
         btn_border_col = (0, 255, 255) if flash else (255, 255, 255)
         title_text = "[ SPACE / คลิก ] รับทราบระดับ & ดับเสียง"
-        if status == "WARNING":
-            sub_text = f"รอเกณฑ์ถัดไป: >= {ALERT_RED_LEVEL:.2f} ม. (CRITICAL)"
-        else:
-            sub_text = "กดเพื่อดับเสียงไซเรนฉุกเฉิน"
+        sub_text = f"รอเกณฑ์ถัดไป: {next_hint}"
         title_color = (255, 255, 255)
         sub_color = (200, 240, 255)
     elif is_acked:
@@ -336,10 +407,7 @@ def draw_hud(frame, waterline_y, level_m, status, ack_stage):
         btn_bg = (35, 75, 45)
         btn_border_col = (50, 220, 120)
         title_text = "[ รับทราบแล้ว ] ดับเสียงเตือนเรียบร้อย"
-        if status == "WARNING":
-            sub_text = f"เฝ้าระวังรอเกณฑ์ถัดไป: >= {ALERT_RED_LEVEL:.2f} ม."
-        else:
-            sub_text = "เฝ้าระวังระดับสูงสุด (ปิดเสียงแล้ว)"
+        sub_text = f"เฝ้าระวังรอเกณฑ์ถัดไป: {next_hint}"
         title_color = (255, 255, 255)
         sub_color = (150, 240, 180)
     else:
@@ -372,17 +440,21 @@ def on_mouse_click(event, x, y, flags, param):
 def main():
     global last_alert_time, current_status, current_level_m, acknowledged_stage
 
-    print("=" * 65)
+    print("=" * 68)
     print("  ระบบตรวจจับระดับน้ำและเตือนภัยอัตโนมัติ (เทศบาลเมืองปทุมธานี)")
     print(f"  Stream: {STREAM_URL}")
-    print(f"  เกณฑ์สีส้ม (เฝ้าระวัง): >= {ALERT_ORANGE_LEVEL:.2f} ม.")
-    print(f"  เกณฑ์สีแดง (วิกฤต):     >= {ALERT_RED_LEVEL:.2f} ม.")
-    print("-" * 65)
+    print(f"  🟠 เกณฑ์สีส้ม (เฝ้าระวัง):      >= {ALERT_ORANGE_LEVEL:.2f} ม.")
+    print(f"  🔴 เกณฑ์สีแดง (วิกฤต):          >= {ALERT_RED_LEVEL:.2f} ม.")
+    print(f"  🔵 สถิติน้ำท่วมปี 2565:          >= {HIST_2565_LEVEL:.2f} ม.")
+    print(f"  🔵 สถิติน้ำท่วมปี 2564:          >= {HIST_2564_LEVEL:.2f} ม.")
+    print(f"  🔵 สถิติน้ำท่วมปี 2553:          >= {HIST_2553_LEVEL:.2f} ม.")
+    print(f"  🔵 สถิติน้ำท่วมปี 2554 (สูงสุด): >= {HIST_2554_LEVEL:.2f} ม.")
+    print("-" * 68)
     print("  🔘 [SPACE] หรือ [คลิกปุ่มบนหน้าจอ]: รับทราบระดับน้ำ ดับเสียง และรอเกณฑ์ถัดไป")
     print("  🔘 [t] / [w]: ทดสอบเสียงเตือนสีส้ม (Warning EAS)")
     print("  🔘 [c]:       ทดสอบเสียงไซเรนสีแดง (Critical Siren)")
     print("  🔘 [q]:       ออกจากโปรแกรม")
-    print("=" * 65)
+    print("=" * 68)
 
     WINDOW_NAME = "Water Level Monitor - Pathumthani"
     cv2.namedWindow(WINDOW_NAME)
@@ -411,41 +483,54 @@ def main():
                 smoothed_y = int(0.7 * smoothed_y + 0.3 * raw_y)
                 current_level_m = round(3.00 - ((smoothed_y - Y_300M) / PIXELS_PER_METER), 2)
 
-                # กำหนดระดับสถานะใหม่
-                if current_level_m >= ALERT_RED_LEVEL:
+                # กำหนดระดับสถานะใหม่ตามเกณฑ์เตือนภัยและสถิติประวัติศาสตร์
+                if current_level_m >= HIST_2554_LEVEL:
+                    detected_status = "HIST_2554"
+                elif current_level_m >= HIST_2553_LEVEL:
+                    detected_status = "HIST_2553"
+                elif current_level_m >= HIST_2564_LEVEL:
+                    detected_status = "HIST_2564"
+                elif current_level_m >= HIST_2565_LEVEL:
+                    detected_status = "HIST_2565"
+                elif current_level_m >= ALERT_RED_LEVEL:
                     detected_status = "CRITICAL"
                 elif current_level_m >= ALERT_ORANGE_LEVEL:
                     detected_status = "WARNING"
                 else:
                     detected_status = "NORMAL"
 
-                # ตรวจสอบการเปลี่ยนผ่านของระดับน้ำ (การรอเกณฑ์ถัดไป)
+                # ตรวจสอบการเปลี่ยนผ่านของระดับน้ำ (ระบบรอเกณฑ์ถัดไป)
+                curr_rank = STAGE_RANKS.get(detected_status, 0)
+                ack_rank = STAGE_RANKS.get(acknowledged_stage, 0) if acknowledged_stage else 0
+
                 if detected_status == "NORMAL":
                     if acknowledged_stage is not None:
                         print(f"[{time.strftime('%H:%M:%S')}] 💧 ระดับน้ำลดลงสู่ระดับปกติ ({current_level_m:.2f} ม.) รีเซ็ตการรับทราบ พร้อมตรวจจับใหม่")
                         acknowledged_stage = None
-                elif detected_status == "CRITICAL" and acknowledged_stage == "WARNING":
-                    # ระดับน้ำสูงขึ้นจากเกณฑ์สีส้ม สู่เกณฑ์วิกฤตสีแดง (เกณฑ์ถัดไปที่รอคอย!)
-                    print(f"\n[{time.strftime('%H:%M:%S')}] 🚨🚨 น้ำขึ้นถึงเกณฑ์ถัดไป! CRITICAL (วิกฤต) ระดับน้ำ: {current_level_m:.2f} ม. >= {ALERT_RED_LEVEL:.2f} ม.!")
-                    acknowledged_stage = None  # ปลดการรับทราบ เพื่อส่งเสียงเตือนระดับ CRITICAL ทันที
-                elif detected_status == "WARNING" and acknowledged_stage == "CRITICAL":
-                    # ระดับน้ำลดลงจากวิกฤตมาที่เตือนภัย
-                    acknowledged_stage = "WARNING"
+                elif curr_rank > ack_rank and ack_rank > 0:
+                    # ระดับน้ำสูงขึ้นถึงเกณฑ์ถัดไป ปลดล็อกการรับทราบเพื่อส่งเสียงเตือนเกณฑ์ใหม่ทันที
+                    stage_name = STAGE_NAMES.get(detected_status, detected_status)
+                    print(f"\n[{time.strftime('%H:%M:%S')}] 🚨🚨 น้ำขึ้นถึงเกณฑ์ถัดไป! {stage_name} ระดับน้ำ: {current_level_m:.2f} ม.!")
+                    acknowledged_stage = None
+                elif curr_rank < ack_rank:
+                    # ระดับน้ำลดลงมาเกณฑ์ที่ต่ำกว่า
+                    acknowledged_stage = detected_status
 
                 current_status = detected_status
 
                 # ตรวจสอบการส่งเสียงเตือน
                 current_time = time.time()
-                if current_status in ["WARNING", "CRITICAL"]:
+                if current_status != "NORMAL":
                     # หากยังไม่ได้รับทราบเกณฑ์ปัจจุบัน ให้ส่งเสียงเตือนตามรอบเวลา
                     if acknowledged_stage != current_status:
                         if current_time - last_alert_time >= ALERT_SOUND_INTERVAL:
                             last_alert_time = current_time
-                            print(f"[{time.strftime('%H:%M:%S')}] 🚨 แจ้งเตือน: {current_status} | ระดับน้ำ: {current_level_m:.2f} ม. (กด SPACE หรือคลิกปุ่มเพื่อรับทราบ/ดับเสียง)")
+                            stage_desc = STAGE_NAMES.get(current_status, current_status)
+                            print(f"[{time.strftime('%H:%M:%S')}] 🚨 แจ้งเตือน: {stage_desc} | ระดับน้ำ: {current_level_m:.2f} ม. (กด SPACE หรือคลิกปุ่มเพื่อรับทราบ/ดับเสียง)")
                             # เรียกเสียงเตือนในเธรดแยก
                             threading.Thread(target=play_alert_sound, args=(current_status,), daemon=True).start()
 
-            # วาดหน้าจอ HUD พร้อมปุ่มรับทราบระดับน้ำ
+            # วาดหน้าจอ HUD พร้อมปุ่มรับทราบระดับน้ำและขีดสถิติต่างๆ
             annotated_frame = draw_hud(frame, smoothed_y, current_level_m, current_status, acknowledged_stage)
 
             # หากเน็ตกระตุกและกำลัง Reconnect ในเบื้องหลัง ให้แสดงป้ายแจ้งเตือนบน HUD
